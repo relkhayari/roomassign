@@ -6,15 +6,15 @@ from typing import Dict, List, Tuple, Optional
 import time
 
 # Gewichte/Strafen (Feinjustierung)
-PENALTY_CLASS_MIX_PER_EXTRA_CLASS = 3    # je zusätzliche Klasse im Zimmer über 1
-PENALTY_EMPTY_BED = 0                    # freie Betten bestrafen (0 = egal)
-PENALTY_CROSS_GENDER_ROOM = 1000         # Sicherheitsnetz (soll 0 bleiben)
-TEACHER_SHARED_ROOM_PENALTY = 2          # Strafe pro weiterer Lehrkraft im selben Zimmer (bevorzugt Einzelzimmer)
+PENALTY_CLASS_MIX_PER_EXTRA_CLASS = 3     # je zusätzliche Klasse im Zimmer über 1
+PENALTY_EMPTY_BED = 0                     # freie Betten bestrafen (0 = egal)
+PENALTY_CROSS_GENDER_ROOM = 1000          # Sicherheitsnetz (soll 0 bleiben)
+TEACHER_SHARED_ROOM_PENALTY = 2           # Strafe pro weiterer Lehrkraft im selben Zimmer (bevorzugt Einzelzimmer)
+PENALTY_TEACHER_WRONG_CORRIDOR = 5        # Lehrkraft nicht auf Flur mit ihrer Klasse
+# NEU: Klassen möglichst nicht über mehrere Flure splitten
+PENALTY_CLASS_SPLIT_ACROSS_CORRIDORS = 4  # je zusätzlicher Flur pro Klasse über 1
 
-# NEU: Strafe, wenn Lehrkraft nicht auf einem Flur liegt, auf dem auch mind. ein(e) Schüler:in ihrer Klasse liegt
-PENALTY_TEACHER_WRONG_CORRIDOR = 5
-
-# Solver-Parameter (Default – kann die GUI überschreiben)
+# Solver-Parameter (Default – GUI kann überschreiben)
 DEFAULT_MAX_TIME_SECONDS = 60.0
 DEFAULT_NUM_WORKERS = 8
 DEFAULT_PROGRESS_INTERVAL = 5.0
@@ -81,7 +81,7 @@ def solve_assignment(
     students = [p for p in persons if people[p]["role"] == "student"]
     teachers = [p for p in persons if people[p]["role"] == "teacher"]
 
-    # Klassenliste nur aus Schüler:innen bilden (Lehrer-Klassen nutzen wir gesondert für die Flur-Penalty)
+    # Klassenliste nur aus Schüler:innen bilden (für Zimmermix & Flur-Tracker)
     classes = sorted({people[p]["class_id"] for p in students if people[p]["class_id"] is not None})
 
     # Entscheidungsvariablen
@@ -122,7 +122,7 @@ def solve_assignment(
                 cap = rooms[r]["capacity"]
                 model.Add(sum(x[q, r] for q in persons) - kmax <= (1 - x[p, r]) * cap)
 
-    # 6) Pro Gang mind. eine Lehrkraft + (optional) konkret geforderte Lehrkräfte
+    # 6) Pro Flur mind. eine Lehrkraft + (optional) konkret geforderte Lehrkräfte
     for c in corridors:
         rooms_on_c = [r for r in room_ids if rooms[r]["corridor"] == c]
         if teachers and rooms_on_c:
@@ -148,60 +148,46 @@ def solve_assignment(
                 model.Add(has_student[r] >= x[s, r])
         model.Add(has_teacher[r] + has_student[r] <= 1)
 
-    # --- NEU: "Lehrer im gleichen Flur wie die eigene Klasse" (weich) ---
-    # Idee: Für jeden Flur c und Klasse k: class_on_c[c,k] = 1, wenn mind. ein(e) Schüler:in von k in Flur c liegt.
-    #      Für jede Lehrkraft t und Flur c: teacher_on_c[t,c] = 1, wenn t in Flur c liegt.
-    #      Mismatch m[t,c] = 1, wenn teacher_on_c[t,c] == 1 aber class_on_c[c,k_t] == 0.
-    #      -> Strafterm für m[t,c].
-    class_on_c = {}    # (c,k) -> Bool
-    teacher_on_c = {}  # (t,c) -> Bool
-    mismatch = {}      # (t,c) -> Bool
-
+    # --- Flur-Hilfsvariablen ---
     corridor_rooms = {c: [r for r in room_ids if rooms[r]["corridor"] == c] for c in corridors}
 
-    # class_on_c: nur Schüler definieren die Präsenz einer Klasse in einem Flur
+    # class_on_c: Klasse k ist auf Flur c vertreten (mind. ein(e) Schüler:in aus k in einem Zimmer des Flurs)
+    class_on_c = {}
     for c in corridors:
         for k in classes:
             v = model.NewBoolVar(f"class_on_c[{c},{k}]")
             class_on_c[(c, k)] = v
             rooms_on_c = corridor_rooms[c]
             members_k = [p for p in students if people[p]["class_id"] == k]
-            # v >= x[p,r] für alle p in k und r in c
             for r in rooms_on_c:
                 for p in members_k:
                     model.Add(v >= x[p, r])
 
-    # teacher_on_c: OR über Zimmer des Flurs
+    # teacher_on_c: Lehrkraft t liegt auf Flur c
+    teacher_on_c = {}
     for t in teachers:
         for c in corridors:
             v = model.NewBoolVar(f"teacher_on_c[{t},{c}]")
             teacher_on_c[(t, c)] = v
-            rooms_on_c = corridor_rooms[c]
-            for r in rooms_on_c:
+            for r in corridor_rooms[c]:
                 model.Add(v >= x[t, r])
 
-    # mismatch-Variablen und Strafterme
+    # mismatch: Lehrkraft mit Klassen-ID, aber auf Flur ohne diese Klasse
+    mismatch = {}
     for t in teachers:
         k_t = people[t].get("class_id")
-        if not k_t:
-            continue  # Lehrkraft ohne Klasse -> keine Flur-Penalty
-        if k_t not in classes:
-            # Falls die Klasse des Lehrers in 'classes' fehlt (z. B. noch keine Schüler eingetragen),
-            # bringen Flur-Penalties nichts – überspringen.
+        if not k_t or k_t not in classes:
             continue
         for c in corridors:
             m = model.NewBoolVar(f"teacher_mismatch[{t},{c}]")
             mismatch[(t, c)] = m
             tc = teacher_on_c[(t, c)]
             ck = class_on_c[(c, k_t)]
-            # m == 1 genau dann, wenn tc == 1 und ck == 0
+            # m = 1 genau wenn tc==1 und ck==0
             model.Add(m <= tc)
             model.Add(m <= 1 - ck)
             model.Add(m >= tc - ck)
-            # Strafterm
-            if PENALTY_TEACHER_WRONG_CORRIDOR > 0:
-                # Jede belegte, "falsche" Flur-Zuordnung wird bestraft
-                pass  # Terme werden unten gesammelt
+
     # 9) Zielfunktion
     objective_terms = []
 
@@ -242,10 +228,21 @@ def solve_assignment(
             model.Add(extra_teachers >= num_teachers_in_r - 1)
             objective_terms.append(extra_teachers * TEACHER_SHARED_ROOM_PENALTY)
 
-    # e) NEU: Flur-Penalty für Lehrkräfte mit Klassenbindung
+    # e) Lehrkraft-Flur-Penalty (weiche Präferenz zum Klassenflur)
     if PENALTY_TEACHER_WRONG_CORRIDOR > 0:
         for (t, c), m in mismatch.items():
             objective_terms.append(m * PENALTY_TEACHER_WRONG_CORRIDOR)
+
+    # f) NEU: Klassen möglichst nicht über mehrere Flure splitten
+    #    Für jede Klasse k: extra_flure_k >= sum_c class_on_c[c,k] - 1
+    if PENALTY_CLASS_SPLIT_ACROSS_CORRIDORS > 0 and corridors and classes:
+        for k in classes:
+            corridors_used = sum(class_on_c[(c, k)] for c in corridors)
+            extra_flure = model.NewIntVar(0, max(0, len(corridors) - 1), f"class_extra_corridors[{k}]")
+            model.Add(extra_flure >= corridors_used - 1)
+            # Wenn Klasse gar nicht vertreten ist, ist corridors_used=0 -> extra_flure >= -1; das passt,
+            # wir wollen dann aber keine Strafe. Begrenzen mit >=0 ist durch Domäne schon gegeben.
+            objective_terms.append(extra_flure * PENALTY_CLASS_SPLIT_ACROSS_CORRIDORS)
 
     if objective_terms:
         model.Minimize(sum(objective_terms))
